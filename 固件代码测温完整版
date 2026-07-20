@@ -1,0 +1,190 @@
+#include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <WiFiManager.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <time.h>
+#include <ESP8266httpUpdate.h>
+
+// DS18B20：DATA 接 D5（GPIO14），DATA 与 3.3V 之间接 4.7kΩ 上拉电阻
+#define ONE_WIRE_BUS D5
+
+// 与网页端相同的 EMQX Cloud 实例；ESP8266 使用原生 MQTT TLS 端口
+const char* mqtt_server = "b7fea2bf.ala.asia-southeast1.emqxsl.com";
+const uint16_t mqtt_port = 8883;
+const char* mqtt_user = "eps8266nn";
+const char* mqtt_pass = "yu155414";
+
+const char* firmware_url = "http://esp8266-yuyu-ota.oss-cn-hangzhou.aliyuncs.com/firmware_door3.bin";
+
+WiFiClientSecure secureClient;
+PubSubClient mqttClient(secureClient);
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+String deviceId;
+String topicCmd;
+String topicStatus;
+const char* topicDiscovery = "door/discovery";
+
+const unsigned long SAMPLE_INTERVAL = 60000UL;
+const unsigned long CONVERSION_TIME = 800UL; // DS18B20 12-bit 转换最长约 750ms
+unsigned long lastReconnectAttempt = 0;
+unsigned long lastSampleStarted = 0;
+unsigned long conversionStarted = 0;
+bool conversionPending = false;
+bool hasReading = false;
+float latestTemperature = 0.0f;
+bool latestSensorOk = false;
+
+void publishStatus(bool online, const char* error = nullptr) {
+  if (!mqttClient.connected()) return;
+
+  char payload[192];
+  if (latestSensorOk && hasReading) {
+    snprintf(payload, sizeof(payload),
+      "{\"temperature\":%.2f,\"unit\":\"°C\",\"online\":%s,\"sensor_ok\":true}",
+      latestTemperature, online ? "true" : "false");
+  } else {
+    snprintf(payload, sizeof(payload),
+      "{\"temperature\":null,\"unit\":\"°C\",\"online\":%s,\"sensor_ok\":false,\"error\":\"%s\"}",
+      online ? "true" : "false", error ? error : "NO_READING");
+  }
+  mqttClient.publish(topicStatus.c_str(), payload, true);
+}
+
+void startTemperatureConversion() {
+  sensors.requestTemperatures();
+  conversionStarted = millis();
+  conversionPending = true;
+}
+
+void finishTemperatureConversion() {
+  const float value = sensors.getTempCByIndex(0);
+  conversionPending = false;
+  hasReading = true;
+
+  if (value == DEVICE_DISCONNECTED_C || isnan(value) || value < -55.0f || value > 125.0f) {
+    latestSensorOk = false;
+    Serial.println("DS18B20 read failed");
+    publishStatus(true, "SENSOR_DISCONNECTED");
+    return;
+  }
+
+  latestTemperature = value;
+  latestSensorOk = true;
+  Serial.printf("Temperature: %.2f °C\n", latestTemperature);
+  publishStatus(true);
+}
+
+void handleOTA() {
+  if (mqttClient.connected()) {
+    mqttClient.publish(topicStatus.c_str(),
+      "{\"online\":true,\"sensor_ok\":false,\"event\":\"OTA_START\"}", true);
+  }
+
+  WiFiClient updateClient;
+  const t_httpUpdate_return result = ESPhttpUpdate.update(updateClient, firmware_url);
+  if (result == HTTP_UPDATE_OK) {
+    delay(1000);
+    ESP.restart();
+  } else {
+    Serial.printf("OTA failed: %d, %s\n", ESPhttpUpdate.getLastError(),
+      ESPhttpUpdate.getLastErrorString().c_str());
+    if (mqttClient.connected()) {
+      mqttClient.publish(topicStatus.c_str(),
+        "{\"online\":true,\"sensor_ok\":false,\"event\":\"OTA_FAIL\"}", true);
+    }
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (String(topic) != topicCmd || length >= 32) return;
+
+  char message[32] = {0};
+  memcpy(message, payload, length);
+  const String command(message);
+
+  // 仅响应温度状态查询和 OTA 维护命令。
+  if (command == "STATUS") publishStatus(true);
+  else if (command == "OTA") handleOTA();
+}
+
+void ensureWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+    delay(100);
+  }
+}
+
+bool ensureMQTT() {
+  if (mqttClient.connected()) return true;
+  if (millis() - lastReconnectAttempt < 5000UL) return false;
+  lastReconnectAttempt = millis();
+
+  const String willPayload =
+    "{\"temperature\":null,\"unit\":\"°C\",\"online\":false,\"sensor_ok\":false,\"error\":\"OFFLINE\"}";
+
+  if (!mqttClient.connect(deviceId.c_str(), mqtt_user, mqtt_pass,
+      topicStatus.c_str(), 1, true, willPayload.c_str())) {
+    Serial.printf("MQTT connect failed, state=%d\n", mqttClient.state());
+    return false;
+  }
+
+  mqttClient.subscribe(topicCmd.c_str(), 1);
+  mqttClient.publish(topicDiscovery, deviceId.c_str(), false);
+  publishStatus(true);
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  deviceId = "door_" + String(ESP.getChipId(), HEX);
+  topicCmd = "door/" + deviceId + "/cmd";
+  topicStatus = "door/" + deviceId + "/status";
+  Serial.printf("Device ID: %s\n", deviceId.c_str());
+
+  WiFiManager wifiManager;
+  wifiManager.autoConnect("TEMPERATURE_SENSOR");
+
+  configTime(28800, 0, "ntp.aliyun.com", "pool.ntp.org");
+  time_t now = time(nullptr);
+  while (now < 16 * 3600) {
+    delay(250);
+    now = time(nullptr);
+  }
+
+  // 当前使用加密传输但跳过 CA 校验。生产环境建议改为 setTrustAnchors() 并配置 EMQX 根证书。
+  secureClient.setInsecure();
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setKeepAlive(60);
+  mqttClient.setBufferSize(256);
+
+  sensors.begin();
+  sensors.setResolution(12);
+  sensors.setWaitForConversion(false);
+  startTemperatureConversion();
+  lastSampleStarted = millis();
+  Serial.println("Temperature monitor ready");
+}
+
+void loop() {
+  ensureWiFi();
+  ensureMQTT();
+  if (mqttClient.connected()) mqttClient.loop();
+
+  const unsigned long now = millis();
+  if (conversionPending && now - conversionStarted >= CONVERSION_TIME) {
+    finishTemperatureConversion();
+  }
+  if (!conversionPending && now - lastSampleStarted >= SAMPLE_INTERVAL) {
+    lastSampleStarted = now;
+    startTemperatureConversion();
+  }
+
+  delay(10);
+}
