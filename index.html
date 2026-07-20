@@ -1,1 +1,147 @@
-5445
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>环境温度监测</title>
+<script src="https://unpkg.com/mqtt@5.3.4/dist/mqtt.min.js"></script>
+<style>
+  :root { --bg:#0f1117; --card:#1c1f2e; --panel:#111318; --line:#2a2d3e; --text:#e5e7eb; --muted:#8b93a5; --brand:#38bdf8; --ok:#22c55e; --danger:#ef4444; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:16px; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  button,input { font:inherit; }
+  .app { width:100%; max-width:440px; }
+  header { margin-bottom:24px; text-align:center; }
+  h1 { color:var(--text); font-size:24px; }
+  .subtitle { margin-top:6px; color:var(--muted); font-size:13px; }
+  .card { padding:20px; border:1px solid var(--line); border-radius:20px; background:var(--card); }
+  .status-bar,.status-item,.actions { display:flex; align-items:center; }
+  .status-bar { justify-content:space-between; margin-bottom:20px; }
+  .status-item { gap:7px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); }
+  .dot.online { background:var(--ok); box-shadow:0 0 6px var(--ok); }
+  .dot.error { background:var(--danger); }
+  .dot.connecting { background:var(--brand); animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.3; } }
+  .conn-label { font-size:13px; font-weight:600; }
+  .device-tag { padding:4px 8px; border:0; border-radius:6px; background:#163348; color:var(--brand); cursor:pointer; font-family:ui-monospace,monospace; font-size:11px; }
+  .temperature { min-height:210px; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:28px 20px; border:1px solid var(--line); border-radius:16px; background:var(--panel); text-align:center; }
+  .temperature-value { color:var(--brand); font-size:64px; font-weight:750; letter-spacing:-3px; line-height:1; }
+  .temperature-value small { margin-left:4px; font-size:24px; letter-spacing:0; }
+  .temperature-label { margin-top:16px; font-size:16px; font-weight:650; }
+  .temperature-meta { margin-top:6px; color:var(--muted); font-size:12px; line-height:1.5; }
+  .notice { display:none; margin-bottom:14px; padding:10px 12px; border:1px solid #5f292e; border-radius:9px; background:#291518; color:#fca5a5; font-size:12px; line-height:1.5; }
+  .notice.visible { display:block; }
+  .actions { gap:10px; margin-top:16px; }
+  .btn { flex:1; padding:12px; border:1px solid var(--line); border-radius:11px; background:var(--panel); color:var(--text); cursor:pointer; font-size:13px; font-weight:650; }
+  .btn:hover { border-color:var(--brand); }
+  .btn:disabled { opacity:.4; cursor:not-allowed; }
+  .btn-primary { border-color:#17627f; background:#0e516b; }
+  .modal-overlay { display:none; position:fixed; inset:0; align-items:center; justify-content:center; padding:16px; background:rgba(0,0,0,.72); }
+  .modal-overlay.open { display:flex; }
+  .modal { width:100%; max-width:360px; padding:24px; border:1px solid var(--line); border-radius:20px; background:var(--card); }
+  .modal h2 { font-size:17px; }
+  .modal p { margin:8px 0 16px; color:var(--muted); font-size:13px; line-height:1.5; }
+  .modal input { width:100%; margin-bottom:12px; padding:12px; border:1px solid var(--line); border-radius:10px; outline:none; background:var(--panel); color:var(--text); }
+  #toast { position:fixed; bottom:24px; left:50%; z-index:10; padding:11px 18px; border:1px solid var(--line); border-radius:11px; background:var(--card); opacity:0; transform:translate(-50%,20px); transition:.25s; pointer-events:none; white-space:nowrap; }
+  #toast.show { opacity:1; transform:translate(-50%,0); }
+</style>
+</head>
+<body>
+<main class="app">
+  <header>
+    <h1>环境温度监测</h1>
+    <p class="subtitle">DS18B20 实时温度 · MQTT 远程监控</p>
+  </header>
+  <section class="card" aria-labelledby="temperatureTitle">
+    <div class="status-bar">
+      <div class="status-item"><span class="dot connecting" id="dot"></span><span class="conn-label" id="connLabel">连接中…</span></div>
+      <button class="device-tag" id="deviceTag" type="button" onclick="openSetup()" title="修改设备 ID">--</button>
+    </div>
+    <div class="notice" id="notice" role="alert"></div>
+    <div class="temperature">
+      <div class="temperature-value" id="temperatureValue">--<small>°C</small></div>
+      <h2 class="temperature-label" id="temperatureTitle">等待温度数据</h2>
+      <p class="temperature-meta" id="temperatureMeta">设备上报周期为 60 秒</p>
+    </div>
+    <div class="actions">
+      <button class="btn" type="button" onclick="requestStatus()">刷新读数</button>
+      <button class="btn btn-primary" id="otaBtn" type="button" onclick="triggerOTA()">OTA 升级</button>
+    </div>
+  </section>
+</main>
+
+<div class="modal-overlay" id="setupModal" role="dialog" aria-modal="true" aria-labelledby="setupTitle">
+  <div class="modal">
+    <h2 id="setupTitle">设置设备 ID</h2>
+    <p>请输入 ESP8266 串口显示的设备 ID，格式为 <code>door_XXXXXXXX</code>。</p>
+    <input id="deviceInput" placeholder="door_2f3a4b5c" autocomplete="off" spellcheck="false">
+    <div class="actions"><button class="btn" type="button" onclick="closeSetup()">取消</button><button class="btn btn-primary" type="button" onclick="applyDeviceId()">确认</button></div>
+  </div>
+</div>
+<div id="toast" role="status"></div>
+
+<script>
+const BROKER_WSS = "wss://b7fea2bf.ala.asia-southeast1.emqxsl.com:8084/mqtt";
+const MQTT_USER = "eps8266nn";
+const MQTT_PASS = "yu155414";
+const OFFLINE_MS = 90000;
+let deviceId = localStorage.getItem("door_device_id") || "";
+let client = null;
+let statusTopic = "";
+let commandTopic = "";
+let lastSeen = 0;
+let offlineTimer = null;
+let toastTimer = null;
+
+function buildTopics() { statusTopic = `door/${deviceId}/status`; commandTopic = `door/${deviceId}/cmd`; }
+function init() { if (!deviceId) { openSetup(); } else { buildTopics(); updateDeviceTag(); } connectMQTT(); }
+function connectMQTT() {
+  if (client) try { client.end(true); } catch (_) {}
+  setConnection("connecting");
+  client = mqtt.connect(BROKER_WSS, { clientId:`web_temp_${Math.random().toString(16).slice(2,10)}`, username:MQTT_USER, password:MQTT_PASS, reconnectPeriod:4000, connectTimeout:8000 });
+  client.on("connect", () => { setConnection("online"); client.subscribe("door/discovery"); if (statusTopic) { client.subscribe(statusTopic, { qos:1 }); requestStatus(); } });
+  client.on("close", () => setConnection("offline"));
+  client.on("reconnect", () => setConnection("connecting"));
+  client.on("error", () => setConnection("error"));
+  client.on("message", onMessage);
+}
+function onMessage(topic, payload) {
+  const message = payload.toString().trim();
+  if (topic === "door/discovery") {
+    if (!deviceId && message.startsWith("door_")) { deviceId = message; localStorage.setItem("door_device_id", deviceId); buildTopics(); updateDeviceTag(); client.subscribe(statusTopic, { qos:1 }); requestStatus(); toast(`已发现设备：${deviceId}`); }
+    return;
+  }
+  if (topic !== statusTopic) return;
+  lastSeen = Date.now(); resetOfflineWatch();
+  let data;
+  try { data = JSON.parse(message); } catch (_) { showNotice("收到旧版或无法识别的设备消息，请升级固件。"); return; }
+  if (data.event === "OTA_START") { setTitle("固件升级中", "请勿断电，设备稍后会自动重连"); return; }
+  if (data.event === "OTA_FAIL") { showNotice("固件升级失败，请稍后重试。"); return; }
+  if (data.online === false) { setOffline("设备已离线或断电。"); return; }
+  if (!data.sensor_ok || typeof data.temperature !== "number" || data.temperature < -55 || data.temperature > 125) { document.getElementById("temperatureValue").innerHTML = "--<small>°C</small>"; setTitle("传感器异常", errorText(data.error)); showNotice("无法读取 DS18B20，请检查接线与 4.7kΩ 上拉电阻。"); return; }
+  hideNotice();
+  document.getElementById("temperatureValue").innerHTML = `${data.temperature.toFixed(1)}<small>°C</small>`;
+  setTitle("当前环境温度", `更新于 ${new Date().toLocaleTimeString("zh-CN", { hour12:false })}`);
+}
+function errorText(error) { return error === "SENSOR_DISCONNECTED" ? "DS18B20 未连接或读数无效" : "暂时没有有效温度读数"; }
+function publishCommand(command) { if (!client?.connected || !deviceId) { toast("MQTT 或设备尚未连接"); return; } client.publish(commandTopic, command, { qos:1 }); }
+function requestStatus() { publishCommand("STATUS"); }
+function triggerOTA() { if (confirm("确定远程升级固件吗？升级期间请勿断电。")) publishCommand("OTA"); }
+function setConnection(state) { document.getElementById("dot").className = `dot ${state}`; document.getElementById("connLabel").textContent = ({online:"MQTT 已连接",offline:"MQTT 已断开",connecting:"连接中…",error:"连接错误"})[state]; }
+function setTitle(title, meta) { document.getElementById("temperatureTitle").textContent = title; document.getElementById("temperatureMeta").textContent = meta; }
+function setOffline(text) { document.getElementById("temperatureValue").innerHTML = "--<small>°C</small>"; setTitle("设备离线", "等待设备重新连接"); showNotice(text); }
+function showNotice(text) { const el=document.getElementById("notice"); el.textContent=text; el.classList.add("visible"); }
+function hideNotice() { document.getElementById("notice").classList.remove("visible"); }
+function resetOfflineWatch() { hideNotice(); clearTimeout(offlineTimer); offlineTimer=setTimeout(() => { if (Date.now()-lastSeen >= OFFLINE_MS) setOffline("超过 90 秒未收到设备数据。"); }, OFFLINE_MS+500); }
+function updateDeviceTag() { document.getElementById("deviceTag").textContent=deviceId || "未设置"; }
+function openSetup() { document.getElementById("deviceInput").value=deviceId; document.getElementById("setupModal").classList.add("open"); setTimeout(() => document.getElementById("deviceInput").focus(),100); }
+function closeSetup() { document.getElementById("setupModal").classList.remove("open"); }
+function applyDeviceId() { const value=document.getElementById("deviceInput").value.trim(); if (!/^door_[0-9a-fA-F]+$/.test(value)) { toast("设备 ID 格式不正确"); return; } deviceId=value; localStorage.setItem("door_device_id",deviceId); buildTopics(); updateDeviceTag(); closeSetup(); connectMQTT(); }
+function toast(text) { const el=document.getElementById("toast"); el.textContent=text; el.classList.add("show"); clearTimeout(toastTimer); toastTimer=setTimeout(() => el.classList.remove("show"),3000); }
+document.getElementById("deviceInput").addEventListener("keydown", event => { if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) applyDeviceId(); });
+init();
+</script>
+</body>
+</html>
+
